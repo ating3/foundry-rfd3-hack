@@ -616,43 +616,43 @@ class DesignInputSpecification(BaseModel):
         
         return conditioning_dict
 
-        def build(self, return_metadata=False):
-            """Main build pipeline."""
-            atom_array_input_annotated = copy.deepcopy(self.atom_array_input)
-            if hasattr(self, 'input2') and self.input2:  
-                atom_array = self.build_dual_conditioning(return_metadata=return_metadata)  
-            else:  
-                atom_array = self._build_init(atom_array_input_annotated) 
+    def build(self, return_metadata=False):
+        """Main build pipeline."""
+        atom_array_input_annotated = copy.deepcopy(self.atom_array_input)
+        if hasattr(self, 'input2') and self.input2:  
+            atom_array = self.build_dual_conditioning(return_metadata=return_metadata)  
+        else:  
+            atom_array = self._build_init(atom_array_input_annotated) 
 
-            # Apply post-processing
-            atom_array = self._append_ligand(atom_array, atom_array_input_annotated)
-            atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)
+        # Apply post-processing
+        atom_array = self._append_ligand(atom_array, atom_array_input_annotated)
+        atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)
 
-            # Apply globals to all tokens (including diffused)
-            atom_array = self._set_origin(atom_array)
-            atom_array = self._apply_globals(atom_array)
+        # Apply globals to all tokens (including diffused)
+        atom_array = self._set_origin(atom_array)
+        atom_array = self._apply_globals(atom_array)
 
-            # Final validation and cleanup
-            check_has_required_conditioning_annotations(
-                atom_array, required=REQUIRED_INFERENCE_ANNOTATIONS
-            )
-            convert_existing_annotations_to_bool(atom_array)
+        # Final validation and cleanup
+        check_has_required_conditioning_annotations(
+            atom_array, required=REQUIRED_INFERENCE_ANNOTATIONS
+        )
+        convert_existing_annotations_to_bool(atom_array)
 
-            # ... Route return type
-            if not return_metadata:
-                return copy.deepcopy(atom_array)
-            else:
-                metadata = self.get_dict_to_save()
-                metadata["extra"] = metadata.get("extra", {}) | {
-                    "num_tokens_in": len(get_token_starts(atom_array)),
-                    "num_residues_in": len(get_residue_starts(atom_array)),
-                    "num_chains": len(np.unique(atom_array.chain_id)),
-                    "num_atoms": len(atom_array),
-                    "num_residues": len(
-                        np.unique(list(zip(atom_array.chain_id, atom_array.res_id)))
-                    ),
-                }
-                return copy.deepcopy(atom_array), metadata
+        # ... Route return type
+        if not return_metadata:
+            return copy.deepcopy(atom_array)
+        else:
+            metadata = self.get_dict_to_save()
+            metadata["extra"] = metadata.get("extra", {}) | {
+                "num_tokens_in": len(get_token_starts(atom_array)),
+                "num_residues_in": len(get_residue_starts(atom_array)),
+                "num_chains": len(np.unique(atom_array.chain_id)),
+                "num_atoms": len(atom_array),
+                "num_residues": len(
+                    np.unique(list(zip(atom_array.chain_id, atom_array.res_id)))
+                ),
+            }
+            return copy.deepcopy(atom_array), metadata
 
     # ============================================================================
     # Building functions
