@@ -143,7 +143,8 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
     def sample_diffusion_like_af3(
         self,
         *,
-        f: dict[str, Any],
+        f1: dict[str, Any],
+        f2: dict[str, Any],
         diffusion_module: torch.nn.Module,
         diffusion_batch_size: int,
         coord_atom_lvl_to_be_noised: Float[torch.Tensor, "D L 3"],
@@ -152,15 +153,15 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         f_ref: dict[str, Any] | None,
     ) -> dict[str, Any]:
         # Motif setup to recenter the motif at every step
-        is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
+        is_motif_atom_with_fixed_coord = f1["is_motif_atom_with_fixed_coord"]
 
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
             device=coord_atom_lvl_to_be_noised.device,
-            partial_t=f.get("partial_t", None),
+            partial_t=f1.get("partial_t", None),
         )
 
-        L = f["ref_element"].shape[0]
+        L = f1["ref_element"].shape[0]
         D = diffusion_batch_size
 
         X_L = self._get_initial_structure(
@@ -238,10 +239,20 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                     for k, v in initializer_outputs.items()
                     if k != "chunked_pairwise_embedder"
                 }
-                outs = diffusion_module(
+                outs1 = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f,
+                    f=f1,
+                    P_LL=None,  # Not used in chunked mode
+                    chunked_pairwise_embedder=chunked_embedder,
+                    initializer_outputs=other_outputs,
+                    **other_outputs,
+                )
+
+                outs2 = diffusion_module(
+                    X_noisy_L=X_noisy_L,
+                    t=t_hat.tile(D),
+                    f=f2,
                     P_LL=None,  # Not used in chunked mode
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
@@ -253,14 +264,39 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 )
             else:
                 # Standard mode: P_LL is included in initializer_outputs
-                outs = diffusion_module(
+                outs1 = diffusion_module(
                     X_noisy_L=X_noisy_L,
                     t=t_hat.tile(D),
-                    f=f,
+                    f=f1,
                     **initializer_outputs,
                 )
 
-            X_denoised_L = outs["X_L"] if "X_L" in outs else outs
+                outs2 = diffusion_module(
+                    X_noisy_L=X_noisy_L,
+                    t=t_hat.tile(D),
+                    f=f2,
+                    **initializer_outputs,
+                )
+
+            X_denoised_L = (outs1["X_L"] + outs2["X_L"]) / 2
+
+            # Handle sequence logits - average them or choose one  
+            sequence_logits_I = None  
+            sequence_indices_I = None  
+            
+            if outs1.get("sequence_logits_I") is not None and outs2.get("sequence_logits_I") is not None:  
+                # Average the logits from both passes  
+                sequence_logits_I = (outs1["sequence_logits_I"] + outs2["sequence_logits_I"]) / 2  
+                sequence_indices_I = outs1["sequence_indices_I"]  # Use indices from first pass  
+            elif outs1.get("sequence_logits_I") is not None:  
+                # Use logits from first pass if second doesn't have them  
+                sequence_logits_I = outs1["sequence_logits_I"]  
+                sequence_indices_I = outs1["sequence_indices_I"]  
+            elif outs2.get("sequence_logits_I") is not None:  
+                # Use logits from second pass if first doesn't have them  
+                sequence_logits_I = outs2["sequence_logits_I"]  
+                sequence_indices_I = outs2["sequence_indices_I"]
+
 
             # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
             delta_L = (
@@ -300,15 +336,15 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 # apply CFG
                 delta_L = delta_L + (self.cfg_scale - 1) * (delta_L - delta_L_ref)
 
-            if exists(outs.get("sequence_logits_I")):
-                # Compute confidence
-                p = torch.softmax(
-                    outs["sequence_logits_I"], dim=-1
-                ).cpu()  # shape (D, L, 32)
-                seq_entropy = -torch.sum(
-                    p * torch.log(p + 1e-10), dim=-1
-                )  # shape (D, L,)
-                sequence_entropy_traj.append(seq_entropy)
+            if sequence_logits_I is not None:  
+                # Compute confidence  
+                p = torch.softmax(  
+                    sequence_logits_I, dim=-1  
+                ).cpu()  # shape (D, L, 32)  
+                seq_entropy = -torch.sum(  
+                    p * torch.log(p + 1e-10), dim=-1  
+                )  # shape (D, L,)  
+                sequence_entropy_traj.append(seq_entropy) 
 
             # Update the coordinates, scaled by the step size
             X_L = X_noisy_L + step_scale * d_t * delta_L
@@ -342,8 +378,8 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             X_noisy_L_traj=X_noisy_L_traj,  # list[Tensor[D, L, 3]]
             X_denoised_L_traj=X_denoised_L_traj,  # list[Tensor[D, L, 3]]
             t_hats=t_hats,  # list[Tensor[D]], where D is shared across all diffusion batches
-            sequence_logits_I=outs.get("sequence_logits_I"),  # (D, I, 32)
-            sequence_indices_I=outs.get("sequence_indices_I"),  # (D, I, 32)
+            sequence_logits_I=sequence_logits_I,  # (D, I, 32)
+            sequence_indices_I=sequence_indices_I,  # (D, I, 32)
             sequence_entropy_traj=sequence_entropy_traj,  # list[Tensor[D, I]]
         )
 
@@ -395,7 +431,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             device=coord_atom_lvl_to_be_noised.device,
             partial_t=f.get("partial_t", None),
         )
-
+ 
         L = f["ref_element"].shape[0]
         D = diffusion_batch_size
         X_L = self._get_initial_structure(
@@ -405,18 +441,18 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
         )  # (D, L, 3)
-
+ 
         X_noisy_L_traj = []
         X_denoised_L_traj = []
         sequence_entropy_traj = []
         t_hats = []
-
+ 
         # symmetrize X_L until the step gamma = gamma_min_sym
         gamma_min_sym_idx = min(
             int(len(noise_schedule) * self.sym_step_frac), len(noise_schedule) - 1
         )
         gamma_min_sym = noise_schedule[gamma_min_sym_idx]
-
+ 
         ranked_logger.info(f"gamma_min_sym: {gamma_min_sym}")
         ranked_logger.info(f"gamma_min: {self.gamma_min}")
         for step_num, (c_t_minus_1, c_t) in enumerate(
@@ -425,7 +461,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
             assert not X_L.requires_grad, "X_L should not require gradients"
-
+ 
             # Apply a random rotation and translation to the structure
             if self.allow_realignment:
                 X_L, R = centre_random_augment_around_motif(
@@ -433,14 +469,14 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     coord_atom_lvl_to_be_noised,
                     is_motif_atom_with_fixed_coord,
                 )
-
+ 
             # Update gamma & step scale
             gamma = self.gamma_0 if c_t > self.gamma_min else 0
             step_scale = self.step_scale
-
+ 
             # Compute the value of t_hat
             t_hat = c_t_minus_1 * (gamma + 1)
-
+ 
             # Noise the coordinates with scaled Gaussian noise
             epsilon_L = (
                 self.noise_scale
@@ -450,10 +486,10 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
                 0  # No noise injection for fixed atoms
             )
-
+ 
             # NOTE: no symmetry applied to the noisy structure
             X_noisy_L = X_L + epsilon_L
-
+ 
             # Denoise the coordinates
             # Handle chunked mode vs standard mode (same as default sampler)
             if "chunked_pairwise_embedder" in initializer_outputs:
@@ -477,9 +513,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     **other_outputs,
                 )
                 toc = time.time()
-                ranked_logger.info(
-                    f"[chunked] step {step_num}: {(toc - tic)*1000:.1f} ms"
-                )
+                ranked_logger.info(f"Chunked mode time: {toc - tic} seconds")
             else:
                 # Standard mode: P_LL is included in initializer_outputs
                 outs = diffusion_module(
@@ -492,17 +526,17 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             if "X_L" in outs and c_t > gamma_min_sym:
                 # outs["original_X_L"] = outs["X_L"].clone()
                 outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
-
+ 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs
-
+ 
             # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
             delta_L = (
                 X_noisy_L - X_denoised_L
             ) / t_hat  # gradient of x wrt. t at x_t_hat
             d_t = c_t - t_hat
-
+ 
             # NOTE: no classifier-free guidance for symmetry
-
+ 
             if exists(outs.get("sequence_logits_I")):
                 # Compute confidence
                 p = torch.softmax(
@@ -512,11 +546,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     p * torch.log(p + 1e-10), dim=-1
                 )  # shape (D, L,)
                 sequence_entropy_traj.append(seq_entropy)
-
+ 
             # Update the coordinates, scaled by the step size
             # delta_L should be symmetric
             X_L = X_noisy_L + step_scale * d_t * delta_L
-
+ 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
                 self.sigma_data * X_noisy_L / torch.sqrt(t_hat**2 + self.sigma_data**2)
@@ -524,7 +558,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             X_noisy_L_traj.append(X_noisy_L_scaled)
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
-
+ 
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end
             X_L, R = centre_random_augment_around_motif(
@@ -533,17 +567,17 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 is_motif_atom_with_fixed_coord,
                 reinsert_motif=self.insert_motif_at_end,
             )
-
+ 
             # apply symmetry frame shift to X_L
             X_L = self.apply_symmetry_to_X_L(X_L, f)
-
+ 
             # Align prediction to original motif
             X_L = weighted_rigid_align(
                 coord_atom_lvl_to_be_noised,
                 X_L,
                 X_exists_L=is_motif_atom_with_fixed_coord,
             )
-
+ 
         return dict(
             X_L=X_L,  # (D, L, 3)
             X_noisy_L_traj=X_noisy_L_traj,  # list[Tensor[D, L, 3]]

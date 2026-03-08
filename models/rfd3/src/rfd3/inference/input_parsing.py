@@ -126,6 +126,7 @@ class DesignInputSpecification(BaseModel):
     # Data inputs
     atom_array_input: Optional[AtomArray] = Field(None, description="Loaded atom array", exclude=True)
     input: Optional[str] =  Field(None, description="Path to input PDB/CIF file")
+    input2: Optional[str] = Field(None, description="Path to second input PDB/CIF file for dual conditioning")  
     # Motif selection from input file
     contig:  Optional[InputSelection] = Field(None, description="Contig specification string (e.g. 'A1-10,B1-5')")
     unindex: Optional[InputSelection] = Field(None, 
@@ -497,45 +498,161 @@ class DesignInputSpecification(BaseModel):
             apply_selections(start, end)
 
         return self
+    
+    @model_validator(mode="after")  
+    def validate_dual_inputs(self):  
+        """Validate that if input2 is provided, input is also provided"""  
+        if self.input2 is not None and self.input is None:  
+            raise ValueError("input must be provided when input2 is specified")  
+        return self
 
     # ========================================================================
     # Building
     # ========================================================================
+    def build_dual_conditioning(self, return_metadata=False):  
+        """Build separate conditioning for both inputs."""  
+        # Validate that both inputs are provided  
+        if not self.input or not self.input2:  
+            raise ValueError("Both 'input' and 'input2' must be provided for dual conditioning")  
+        
+        # Load first input and build conditioning  
+        atom_array1 = inference_load_(  
+            self.input, cif_parser_args=self.get("cif_parser_args")  
+        )["atom_array"]  
+        
+        # Create first conditioning dict  
+        f1 = self._build_conditioning_dict(atom_array1, self.input)  
+        
+        # Load second input and build conditioning    
+        atom_array2 = inference_load_(  
+            self.input2, cif_parser_args=self.get("cif_parser_args")  
+        )["atom_array"]  
+        
+        # Create second conditioning dict  
+        f2 = self._build_conditioning_dict(atom_array2, self.input2)  
+        
+        # Use first input as base structure for the pipeline  
+        atom_array_input_annotated = copy.deepcopy(atom_array1)  
+        atom_array = self._build_init(atom_array_input_annotated)  
+        
+        # Apply post-processing to base structure  
+        atom_array = self._append_ligand(atom_array, atom_array_input_annotated)  
+        atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)  
+        atom_array = self._set_origin(atom_array)  
+        atom_array = self._apply_globals(atom_array)  
+        
+        # Final validation  
+        check_has_required_conditioning_annotations(  
+            atom_array, required=REQUIRED_INFERENCE_ANNOTATIONS  
+        )  
+        convert_existing_annotations_to_bool(atom_array)  
+        
+        # Route return type with dual conditioning  
+        if not return_metadata:  
+            return copy.deepcopy(atom_array)  
+        else:  
+            metadata = self.get_dict_to_save()  
+            metadata["extra"] = metadata.get("extra", {}) | {  
+                "num_tokens_in": len(get_token_starts(atom_array)),  
+                "num_residues_in": len(get_residue_starts(atom_array)),  
+                "num_chains": len(np.unique(atom_array.chain_id)),  
+                "num_atoms": len(atom_array),  
+                "num_residues": len(  
+                    np.unique(list(zip(atom_array.chain_id, atom_array.res_id)))  
+                ),  
+                "dual_conditioning": True,  
+                "input1": self.input,  
+                "input2": self.input2,  
+            }  
+            
+            # Return atom array and both conditioning dicts  
+            return copy.deepcopy(atom_array), {  
+                "f1": f1,  
+                "f2": f2,  
+                "metadata": metadata  
+            }  
+    
+    def _build_conditioning_dict(self, atom_array, input_path):  
+        """Build conditioning dictionary from atom array."""  
+        # Apply conditioning annotations to the atom array  
+        atom_array_annotated = copy.deepcopy(atom_array)  
+        
+        # Apply all conditioning selections  
+        selection_fields = {  
+            "select_fixed_atoms": ("is_motif_atom_with_fixed_coord", True, False),  
+            "select_unfixed_sequence": ("is_motif_atom_with_fixed_seq", False, True),  
+            "unindex": ("is_motif_atom_unindexed", True, False),  
+            "select_hotspots": ("is_atom_level_hotspot", True, False),  
+            "select_hbond_acceptor": ("active_acceptor", True, False),  
+            "select_hbond_donor": ("active_donor", True, False),  
+            "select_buried": ("rasa_bin", 0, 3),  
+            "select_partially_buried": ("rasa_bin", 1, 3),  
+            "select_exposed": ("rasa_bin", 2, 3),  
+        }  
+        
+        # Initialize annotations  
+        for name, val in REQUIRED_CONDITIONING_ANNOTATION_VALUES.items():  
+            atom_array_annotated.set_annotation(name, np.full(atom_array_annotated.array_length(), val, dtype=int))  
+        
+        # Apply selections  
+        starts = get_residue_starts(atom_array_annotated, add_exclusive_stop=True)  
+        for start, end in zip(starts[:-1], starts[1:]):  
+            chain_id = atom_array_annotated.chain_id[start]  
+            res_id = atom_array_annotated.res_id[start]  
+            
+            for selection_name, (annotation_name, set_value, default_value) in selection_fields.items():  
+                if hasattr(self, selection_name):  
+                    selection = getattr(self, selection_name)  
+                    atom_names_sele = selection.get(f"{chain_id}{res_id}")  
+                    
+                    if atom_names_sele is not None:  
+                        mask = np.isin(atom_array_annotated.atom_name[start:end], atom_names_sele)  
+                        atom_array_annotated.get_annotation(annotation_name)[start:end] = np.where(  
+                            mask, set_value, default_value  
+                        ).astype(np.int_)  
+        
+        # Convert to conditioning dict format expected by model  
+        conditioning_dict = prepare_pipeline_input_from_atom_array(atom_array_annotated)  
+        
+        return conditioning_dict
 
-    def build(self, return_metadata=False):
-        """Main build pipeline."""
-        atom_array_input_annotated = copy.deepcopy(self.atom_array_input)
-        atom_array = self._build_init(atom_array_input_annotated)
+        def build(self, return_metadata=False):
+            """Main build pipeline."""
+            atom_array_input_annotated = copy.deepcopy(self.atom_array_input)
+            if hasattr(self, 'input2') and self.input2:  
+                atom_array = self.build_dual_conditioning(return_metadata=return_metadata)  
+            else:  
+                atom_array = self._build_init(atom_array_input_annotated) 
 
-        # Apply post-processing
-        atom_array = self._append_ligand(atom_array, atom_array_input_annotated)
-        atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)
+            # Apply post-processing
+            atom_array = self._append_ligand(atom_array, atom_array_input_annotated)
+            atom_array = self._apply_symmetry(atom_array, atom_array_input_annotated)
 
-        # Apply globals to all tokens (including diffused)
-        atom_array = self._set_origin(atom_array)
-        atom_array = self._apply_globals(atom_array)
+            # Apply globals to all tokens (including diffused)
+            atom_array = self._set_origin(atom_array)
+            atom_array = self._apply_globals(atom_array)
 
-        # Final validation and cleanup
-        check_has_required_conditioning_annotations(
-            atom_array, required=REQUIRED_INFERENCE_ANNOTATIONS
-        )
-        convert_existing_annotations_to_bool(atom_array)
+            # Final validation and cleanup
+            check_has_required_conditioning_annotations(
+                atom_array, required=REQUIRED_INFERENCE_ANNOTATIONS
+            )
+            convert_existing_annotations_to_bool(atom_array)
 
-        # ... Route return type
-        if not return_metadata:
-            return copy.deepcopy(atom_array)
-        else:
-            metadata = self.get_dict_to_save()
-            metadata["extra"] = metadata.get("extra", {}) | {
-                "num_tokens_in": len(get_token_starts(atom_array)),
-                "num_residues_in": len(get_residue_starts(atom_array)),
-                "num_chains": len(np.unique(atom_array.chain_id)),
-                "num_atoms": len(atom_array),
-                "num_residues": len(
-                    np.unique(list(zip(atom_array.chain_id, atom_array.res_id)))
-                ),
-            }
-            return copy.deepcopy(atom_array), metadata
+            # ... Route return type
+            if not return_metadata:
+                return copy.deepcopy(atom_array)
+            else:
+                metadata = self.get_dict_to_save()
+                metadata["extra"] = metadata.get("extra", {}) | {
+                    "num_tokens_in": len(get_token_starts(atom_array)),
+                    "num_residues_in": len(get_residue_starts(atom_array)),
+                    "num_chains": len(np.unique(atom_array.chain_id)),
+                    "num_atoms": len(atom_array),
+                    "num_residues": len(
+                        np.unique(list(zip(atom_array.chain_id, atom_array.res_id)))
+                    ),
+                }
+                return copy.deepcopy(atom_array), metadata
 
     # ============================================================================
     # Building functions
@@ -781,18 +898,26 @@ class DesignInputSpecification(BaseModel):
         else:
             return cls(**spec_kwargs)
 
-    def to_pipeline_input(self, example_id):
-        atom_array, spec_dict = self.build(return_metadata=True)
-
-        # ... Forward into
-        data = prepare_pipeline_input_from_atom_array(atom_array)
-        data["example_id"] = example_id
-
-        # ... Wrap up with additional features
-        if "extra" not in spec_dict:
-            spec_dict["extra"] = {}
-        spec_dict["extra"]["example_id"] = example_id
-        data["specification"] = spec_dict
+    def to_pipeline_input(self, example_id):  
+        result = self.build(return_metadata=True)  
+        
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):  
+            # Dual conditioning case  
+            atom_array, conditioning_data = result  
+            data = prepare_pipeline_input_from_atom_array(atom_array)  
+            data["example_id"] = example_id  
+            
+            # Add both conditioning dicts  
+            data["f1"] = conditioning_data["f1"]  
+            data["f2"] = conditioning_data["f2"]  
+            data["specification"] = conditioning_data["metadata"]  
+        else:  
+            # Single conditioning case (original behavior)  
+            atom_array, spec_dict = result  
+            data = prepare_pipeline_input_from_atom_array(atom_array)  
+            data["example_id"] = example_id  
+            data["specification"] = spec_dict  
+        
         return data
 
 
