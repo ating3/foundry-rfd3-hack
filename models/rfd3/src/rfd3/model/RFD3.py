@@ -93,8 +93,18 @@ class RFD3(nn.Module):
                 f_ref = None
                 ref_initializer_outputs = None
 
+            if "f1" in input and "f2" in input:  
+                # Dual conditioning case  
+                f1 = input["f1"]  
+                f2 = input["f2"]  
+            else:  
+                # Single conditioning case - use f for both  
+                f1 = input["f"]  
+                f2 = input["f"] 
+
             return self.inference_sampler.sample_diffusion_like_af3(
-                f=input["f"],
+                f1=f1,  
+                f2=f2, 
                 f_ref=f_ref,  # for cfg
                 diffusion_module=self.diffusion_module,
                 diffusion_batch_size=coord_atom_lvl_to_be_noised.shape[0],
